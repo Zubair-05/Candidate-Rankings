@@ -3,45 +3,56 @@ Seniority Calibration Scorer
 
 Signal: Is this candidate right-sized for the role?
 
-Methodology — three inputs as discussed:
-  1. Years of experience fit   (bell curve, not hard cutoff)
-  2. Title level fit           (target = Senior/Staff/Lead = levels 3–4)
-  3. Skill depth               (avg proficiency of AI/ML skills)
+Three inputs — none are hard cutoffs:
+  1. Years of experience fit  (bell curve, weight 0.25 — least important)
+  2. Title level fit          (weight 0.45 — primary signal)
+  3. AI skill depth           (weight 0.30 — what they can actually do)
 
-A 3-year fast-tracker with Senior title and expert-level skills scores well.
-A 12-year candidate stuck at mid-level with intermediate skills scores lower.
-Neither is hard-filtered — Layer 3 makes the final call.
+Weight rationale: YOE is the weakest signal because people gain depth at
+different rates. A 3-year candidate who has a Staff title and expert-level
+AI skills has clearly earned that level — penalising them heavily for YOE
+would be wrong. Title and skill depth together tell a more honest story.
+
+Fast-tracker override: if title ≥ Senior AND skill depth ≥ 0.75, the YOE
+component is floored so it cannot drag the composite below 0.70. These
+candidates go to Layer 3 where Claude reads their actual work.
+
+Layer 3 (Claude) makes the final call on all borderline cases.
 """
 from __future__ import annotations
 
 import math
 import re
-from typing import Any
+from typing import Any, Optional
 
+from app.models.candidate import Candidate, SkillProficiency
 from app.services.signal_scorers.base import BaseScorer, ScorerResult
 
-# JD target band
-_YOE_MIN = 5.0
-_YOE_MAX = 9.0
-_YOE_IDEAL = 7.0   # centre of the bell curve
+_YOE_MIN  = 5.0
+_YOE_MAX  = 9.0
 
-# Title → level (same mapping as career_trajectory.py)
 _TITLE_LEVELS: list[tuple[re.Pattern, int]] = [
     (re.compile(r"vp|vice president|chief|cto|ceo|coo", re.I), 6),
     (re.compile(r"director|head of", re.I), 5),
     (re.compile(r"principal|distinguished|fellow", re.I), 5),
     (re.compile(r"staff|architect", re.I), 4),
-    (re.compile(r"lead|manager|tech lead", re.I), 4),
+    (re.compile(r'tech lead|engineering manager|ml manager|ai manager|(?:^|\s)lead(?:\s|$)', re.I), 4),
     (re.compile(r"senior|sr\.?", re.I), 3),
     (re.compile(r"junior|jr\.?|associate|intern|trainee", re.I), 1),
 ]
 _DEFAULT_LEVEL = 2
 
-_PROFICIENCY_WEIGHTS = {"beginner": 0.25, "intermediate": 0.5, "advanced": 0.75, "expert": 1.0}
+_PROFICIENCY_SCORE: dict[SkillProficiency, float] = {
+    SkillProficiency.BEGINNER:     0.25,
+    SkillProficiency.INTERMEDIATE: 0.50,
+    SkillProficiency.ADVANCED:     0.75,
+    SkillProficiency.EXPERT:       1.00,
+}
 
-_AI_SKILL_KEYWORDS = {
-    "machine learning", "deep learning", "nlp", "llm", "rag", "embedding",
-    "vector", "pytorch", "tensorflow", "python", "transformers", "mlops",
+_AI_KEYWORDS = {
+    "machine learning", "deep learning", "nlp", "llm", "rag",
+    "embedding", "vector", "pytorch", "tensorflow", "python",
+    "transformers", "mlops",
 }
 
 
@@ -53,13 +64,8 @@ def _title_level(title: str) -> int:
 
 
 def _yoe_fit(yoe: float) -> float:
-    """
-    Bell curve centred on _YOE_IDEAL. Full score within [_YOE_MIN, _YOE_MAX].
-    Falls off smoothly outside the band — never hard zero.
-    """
     if _YOE_MIN <= yoe <= _YOE_MAX:
         return 1.0
-    # Gaussian decay outside the band
     distance = min(abs(yoe - _YOE_MIN), abs(yoe - _YOE_MAX))
     return max(0.2, math.exp(-0.08 * distance ** 2))
 
@@ -68,71 +74,68 @@ class SeniorityScorer(BaseScorer):
     name = "seniority_calibration"
     weight = 1.5
     description = (
-        "Measures right-sizing: years fit (bell curve), title level, and AI skill depth. "
-        "Fast-trackers score well on title+skill even if YOE is below band."
+        "Bell-curve YOE fit + title level + AI skill depth. "
+        "No hard cutoffs — fast-trackers with strong titles score well below the YOE band."
     )
 
-    def score(self, candidate: dict[str, Any]) -> ScorerResult:
+    def score(
+        self,
+        candidate: Candidate,
+        context: Optional[dict[str, Any]] = None,
+    ) -> ScorerResult:
         try:
             return self._compute(candidate)
         except Exception as exc:
             return self._missing(f"unexpected error: {exc}")
 
-    def _compute(self, candidate: dict[str, Any]) -> ScorerResult:
-        profile = candidate.get("profile", {})
-        skills = candidate.get("skills", [])
-        history = candidate.get("career_history", [])
-
-        # --- 1. Years of experience (weight 0.4) ---
-        yoe = profile.get("years_of_experience")
-        if yoe is None:
-            yoe_score = 0.5
-            yoe_note = "yoe=unknown"
-        else:
-            yoe_score = _yoe_fit(float(yoe))
-            yoe_note = f"yoe={yoe:.1f}"
+    def _compute(self, candidate: Candidate) -> ScorerResult:
+        # --- 1. YOE fit (weight 0.4) ---
+        yoe       = candidate.profile.years_of_experience
+        yoe_score = _yoe_fit(yoe)
 
         # --- 2. Title level fit (weight 0.4) ---
-        current_title = profile.get("current_title", "")
-        level = _title_level(current_title)
-        # Ideal = 3–4; below = under, above = slightly over-leveled for the role
-        if level in (3, 4):
+        current_level = _title_level(candidate.profile.current_title)
+        if current_level in (3, 4):
             title_score = 1.0
-        elif level == 2:
+        elif current_level == 2:
             title_score = 0.6
-        elif level == 1:
+        elif current_level == 1:
             title_score = 0.3
-        elif level == 5:
-            title_score = 0.75   # principal/director — strong but possibly over-leveled
-        else:  # level 6 — VP/CXO
+        elif current_level == 5:
+            title_score = 0.75
+        else:  # VP/CXO — over-leveled
             title_score = 0.5
 
-        # Boost if history shows they've held Senior+ titles even if current is lower
-        if history:
-            peak_level = max(_title_level(r.get("title", "")) for r in history)
-            if peak_level > level:
-                title_score = max(title_score, 0.75)
+        # Rescue: candidate may have stepped down for a startup move
+        peak_level = max((_title_level(r.title) for r in candidate.career_history), default=current_level)
+        if peak_level > current_level:
+            title_score = max(title_score, 0.75)
 
-        # --- 3. AI skill depth (weight 0.2) ---
+        # --- 3. AI skill depth (weight 0.30) ---
         ai_skills = [
-            s for s in skills
-            if any(kw in s.get("name", "").lower() for kw in _AI_SKILL_KEYWORDS)
+            s for s in candidate.skills
+            if any(kw in s.name.lower() for kw in _AI_KEYWORDS)
         ]
         if ai_skills:
-            avg_prof = sum(
-                _PROFICIENCY_WEIGHTS.get(s.get("proficiency", "beginner"), 0.25)
-                for s in ai_skills
-            ) / len(ai_skills)
-            skill_depth_score = self._clamp(avg_prof)
+            avg_prof    = sum(_PROFICIENCY_SCORE[s.proficiency] for s in ai_skills) / len(ai_skills)
+            skill_score = self._clamp(avg_prof)
         else:
-            skill_depth_score = 0.2
+            skill_score = 0.2
 
-        composite = 0.4 * yoe_score + 0.4 * title_score + 0.2 * skill_depth_score
+        # Fast-tracker override: strong title + strong skills = YOE is not the
+        # bottleneck. Floor the composite so YOE can't drag a clearly-capable
+        # candidate below the threshold for Layer 3.
+        fast_tracker = current_level >= 3 and skill_score >= 0.75
+        if fast_tracker:
+            yoe_score = max(yoe_score, 0.65)
 
+        composite = 0.25 * yoe_score + 0.45 * title_score + 0.30 * skill_score
+
+        fast_tracker_note = " [fast-tracker override applied]" if fast_tracker else ""
         rationale = (
-            f"{yoe_note}, title='{current_title}'(level {level}), "
-            f"ai_skills={len(ai_skills)}, "
-            f"yoe_fit={yoe_score:.2f}, title_fit={title_score:.2f}, "
-            f"skill_depth={skill_depth_score:.2f}"
+            f"yoe={yoe:.1f}(fit={yoe_score:.2f}), "
+            f"title='{candidate.profile.current_title}'(level {current_level}, fit={title_score:.2f}), "
+            f"ai_skills={len(ai_skills)}(depth={skill_score:.2f})"
+            f"{fast_tracker_note}"
         )
         return self._result(self._clamp(composite), rationale)

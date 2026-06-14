@@ -121,7 +121,7 @@ def rank_candidates(req: RankRequest) -> RankResponse:
         raise HTTPException(status_code=500, detail="No candidates hydrated — check candidates.jsonl path")
 
     # Layer 2
-    scored = score_candidates_bulk(hydrated, top_k=req.signal_top_k)
+    scored = score_candidates_bulk(hydrated, jd_query=req.query, top_k=req.signal_top_k)
 
     ranked: list[RankedCandidate] = []
     for rank, result in enumerate(scored, start=1):
