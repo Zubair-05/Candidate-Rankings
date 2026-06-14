@@ -1,8 +1,12 @@
+import io
 import json
 import logging
 from pathlib import Path
+from typing import Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException
+import fitz  # pymupdf
+import docx
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from app.models.retrieval import RetrievalResult
@@ -15,7 +19,7 @@ router = APIRouter(prefix="/api", tags=["ranking"])
 _CANDIDATES_PATH = Path(__file__).resolve().parents[2] / "data" / "raw" / "candidates.jsonl"
 
 # Module-level cache — candidates.jsonl loaded once on first request
-_candidates_by_id: dict[str, dict] | None = None
+_candidates_by_id: Optional[Dict[str, dict]] = None
 
 
 def _load_candidates() -> dict[str, dict]:
@@ -62,9 +66,9 @@ class RankedCandidate(BaseModel):
     rank: int
     candidate_id: str
     composite_score: float
-    scorer_breakdown: list[dict]
-    dense_rank: int | None = None
-    sparse_rank: int | None = None
+    scorer_breakdown: List[dict]
+    dense_rank: Optional[int] = None
+    sparse_rank: Optional[int] = None
     rrf_score: float
 
 
@@ -73,7 +77,7 @@ class RankResponse(BaseModel):
     total_retrieved: int
     total_scored: int
     top_k: int
-    candidates: list[RankedCandidate]
+    candidates: List[RankedCandidate]
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +116,7 @@ def rank_candidates(req: RankRequest) -> RankResponse:
 
     # Hydrate with full candidate data for signal scoring
     candidates_store = _load_candidates()
-    hydrated: list[dict] = []
+    hydrated: List[dict] = []
     for cid in retrieved_ids:
         if cid in candidates_store:
             hydrated.append(candidates_store[cid])
@@ -123,7 +127,7 @@ def rank_candidates(req: RankRequest) -> RankResponse:
     # Layer 2
     scored = score_candidates_bulk(hydrated, jd_query=req.query, top_k=req.signal_top_k)
 
-    ranked: list[RankedCandidate] = []
+    ranked: List[RankedCandidate] = []
     for rank, result in enumerate(scored, start=1):
         retrieval_meta = retrieved_ids.get(result.candidate_id)
         ranked.append(RankedCandidate(
@@ -143,3 +147,67 @@ def rank_candidates(req: RankRequest) -> RankResponse:
         top_k=len(ranked),
         candidates=ranked,
     )
+
+
+def _extract_text_from_pdf(data: bytes) -> str:
+    doc = fitz.open(stream=data, filetype="pdf")
+    return "\n".join(page.get_text() for page in doc)
+
+
+def _extract_text_from_docx(data: bytes) -> str:
+    document = docx.Document(io.BytesIO(data))
+    return "\n".join(p.text for p in document.paragraphs if p.text.strip())
+
+
+@router.post(
+    "/rank/upload",
+    response_model=RankResponse,
+    summary="Layer 1 + 2 — accepts JD as text, PDF, or DOCX",
+)
+async def rank_candidates_upload(
+    jd_text: Optional[str] = Form(default=None),
+    file: Optional[UploadFile] = File(default=None),
+    retrieval_top_k: int = Form(default=2000),
+    signal_top_k: int = Form(default=50),
+) -> RankResponse:
+    """
+    Accepts a JD either as plain text (jd_text form field) or as an uploaded
+    PDF / DOCX file. Runs the full Layer 1 → 2 pipeline and returns ranked candidates.
+    """
+    if file is not None:
+        raw = await file.read()
+        ct = file.content_type or ""
+        filename = file.filename or ""
+        if "pdf" in ct or filename.lower().endswith(".pdf"):
+            query = _extract_text_from_pdf(raw)
+        elif "word" in ct or "docx" in ct or filename.lower().endswith(".docx"):
+            query = _extract_text_from_docx(raw)
+        elif filename.lower().endswith(".doc"):
+            raise HTTPException(status_code=400, detail="Legacy .doc format not supported — please upload .docx or PDF")
+        else:
+            query = raw.decode("utf-8", errors="replace")
+    elif jd_text:
+        query = jd_text.strip()
+    else:
+        raise HTTPException(status_code=422, detail="Provide either jd_text or a file upload")
+
+    if len(query) < 20:
+        raise HTTPException(status_code=422, detail="Job description too short — needs at least 20 characters")
+
+    return rank_candidates(RankRequest(
+        query=query,
+        retrieval_top_k=retrieval_top_k,
+        signal_top_k=signal_top_k,
+    ))
+
+
+@router.get(
+    "/candidates/{candidate_id}",
+    summary="Get full candidate profile by ID",
+)
+def get_candidate(candidate_id: str) -> dict:
+    candidates_store = _load_candidates()
+    candidate = candidates_store.get(candidate_id)
+    if candidate is None:
+        raise HTTPException(status_code=404, detail=f"Candidate {candidate_id!r} not found")
+    return candidate

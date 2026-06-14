@@ -1,7 +1,9 @@
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 
 from app.routers import health, ranking
 from app.services import retrieval
@@ -27,3 +29,6 @@ app = FastAPI(
 
 app.include_router(health.router)
 app.include_router(ranking.router)
+
+_static = Path(__file__).parent / "static"
+app.mount("/", StaticFiles(directory=str(_static), html=True), name="static")
