@@ -19,6 +19,9 @@ Recruiters miss good candidates because keyword filters can't interpret context.
 * Deployment: GCP Cloud Run + Docker
 * CI/CD: GitHub Actions
 
+
+Audience: This codebase will be reviewed by the Redrob AI hiring team as a Senior AI/ML Engineer application. Code quality, architectural decisions, and documentation are being evaluated as much as correctness. Write as a senior engineer would.
+
 ## Architecture — three layers
 
 ### Layer 1: Semantic fit
