@@ -7,18 +7,18 @@ adding a scorer requires zero changes here.
 """
 from __future__ import annotations
 
-import logging
 import time
 from typing import Any, Optional
 
 import numpy as np
 from pydantic import BaseModel, ValidationError
 
+from app.logger import get_logger, log_latency
 from app.models.candidate import Candidate
 from app.services.signal_scorers import REGISTERED_SCORERS
 from app.services.signal_scorers.base import BaseScorer, ScorerResult
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class SignalScoringResult(BaseModel):
@@ -40,15 +40,20 @@ def build_scoring_context(jd_query: str) -> dict[str, Any]:
     context: dict[str, Any] = {"jd_query": jd_query}
 
     if _embed_model is not None:
+        t0 = time.perf_counter()
         jd_embedding = _embed_model.encode(
             jd_query, normalize_embeddings=True, convert_to_numpy=True,
         ).astype(np.float32)
+        logger.debug(
+            "JD embedding encoded",
+            extra={"latency_ms": round((time.perf_counter() - t0) * 1000, 1), "dims": jd_embedding.shape[0]},
+        )
         context["jd_embedding"] = jd_embedding
         context["embed_model"]  = _embed_model
     else:
         logger.warning(
-            "Retrieval model not loaded — domain_relevance will fall back to neutral. "
-            "Call retrieval.build_index() at startup."
+            "Retrieval model not loaded — domain_relevance scorer will fall back to neutral score. "
+            "Ensure retrieval.build_index() is called at startup."
         )
 
     return context
@@ -91,33 +96,49 @@ def score_candidates_bulk(
     Parse raw dicts → Candidate models at the boundary, score all,
     return top_k sorted by composite score descending.
     """
-    t0 = time.perf_counter()
-    context = build_scoring_context(jd_query)
-
-    scored: list[SignalScoringResult] = []
+    t0           = time.perf_counter()
     parse_errors = 0
+    scored: list[SignalScoringResult] = []
 
+    with log_latency(logger, "build_scoring_context"):
+        context = build_scoring_context(jd_query)
+
+    t_score = time.perf_counter()
     for raw in raw_candidates:
         try:
             candidate = Candidate.model_validate(raw)
         except ValidationError as exc:
             parse_errors += 1
-            logger.debug("Skipping %s — validation error: %s", raw.get("candidate_id"), exc)
+            logger.debug(
+                "Candidate skipped — validation error",
+                extra={"candidate_id": raw.get("candidate_id"), "error": str(exc)},
+            )
             continue
         scored.append(score_candidate(candidate, context=context))
 
     if parse_errors:
-        logger.warning("%d candidates skipped due to schema validation errors", parse_errors)
+        logger.warning(
+            "Candidates skipped due to schema validation errors",
+            extra={"skipped": parse_errors, "total": len(raw_candidates)},
+        )
 
     scored.sort(key=lambda r: r.composite_score, reverse=True)
     top = scored[:top_k]
 
-    elapsed = time.perf_counter() - t0
+    score_ms  = round((time.perf_counter() - t_score) * 1000, 1)
+    total_ms  = round((time.perf_counter() - t0) * 1000, 1)
+
     logger.info(
-        "signal scoring: %d/%d valid candidates → top %d in %.2fs "
-        "(score range %.3f–%.3f)",
-        len(scored), len(raw_candidates), len(top), elapsed,
-        top[-1].composite_score if top else 0,
-        top[0].composite_score if top else 0,
+        "layer2_scoring complete",
+        extra={
+            "total_ms":    total_ms,
+            "scoring_ms":  score_ms,
+            "input":       len(raw_candidates),
+            "valid":       len(scored),
+            "parse_errors": parse_errors,
+            "output":      len(top),
+            "score_min":   top[-1].composite_score if top else 0,
+            "score_max":   top[0].composite_score  if top else 0,
+        },
     )
     return top

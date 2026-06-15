@@ -1,6 +1,7 @@
 import io
 import json
-import logging
+import time
+import uuid
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -10,12 +11,13 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from app.config import settings
+from app.logger import get_logger, log_latency, log_pipeline_summary
 from app.models.retrieval import RetrievalResult
 from app.services import retrieval
 from app.services.llm_judge import JudgedCandidate, judge_candidates
 from app.services.signal_scorers.engine import SignalScoringResult, score_candidates_bulk
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 router = APIRouter(prefix="/api", tags=["ranking"])
 
 _CANDIDATES_PATH = Path(__file__).resolve().parents[2] / "data" / "raw" / "candidates.jsonl"
@@ -251,8 +253,16 @@ async def rank_candidates_full(req: FullRankRequest) -> FullRankResponse:
       2. Signal scoring       → top signal_top_k candidates
       3. LLM judge (parallel) → final top-k reranked with reasoning
     """
+    request_id = uuid.uuid4().hex[:8]
+    logger.info(
+        "pipeline_start",
+        extra={"request_id": request_id, "jd_preview": req.query[:80].replace("\n", " ")},
+    )
+
     # Layer 1
+    t1 = time.perf_counter()
     retrieval_result = retrieval.retrieve(query=req.query, top_k=req.retrieval_top_k)
+    layer1_ms = round((time.perf_counter() - t1) * 1000, 1)
     retrieved_ids = {c.candidate_id: c for c in retrieval_result.candidates}
 
     # Hydrate
@@ -266,15 +276,16 @@ async def rank_candidates_full(req: FullRankRequest) -> FullRankResponse:
         raise HTTPException(status_code=500, detail="No candidates hydrated — check candidates.jsonl path")
 
     # Layer 2
+    t2 = time.perf_counter()
     scored = score_candidates_bulk(hydrated, jd_query=req.query, top_k=req.signal_top_k)
+    layer2_ms = round((time.perf_counter() - t2) * 1000, 1)
 
-    # Build layer2 dicts for Layer 3 (includes retrieval metadata)
     layer2_dicts: List[dict] = []
     for result in scored:
         meta = retrieved_ids.get(result.candidate_id)
         layer2_dicts.append({
-            "candidate_id":    result.candidate_id,
-            "composite_score": result.composite_score,
+            "candidate_id":     result.candidate_id,
+            "composite_score":  result.composite_score,
             "scorer_breakdown": [r.model_dump() for r in result.scorer_breakdown],
             "dense_rank":  meta.dense_rank  if meta else None,
             "sparse_rank": meta.sparse_rank if meta else None,
@@ -282,10 +293,26 @@ async def rank_candidates_full(req: FullRankRequest) -> FullRankResponse:
         })
 
     # Layer 3
+    t3 = time.perf_counter()
     judged = await judge_candidates(
         layer2_results=layer2_dicts,
         candidates_store=candidates_store,
         jd=req.query,
+    )
+    layer3_ms = round((time.perf_counter() - t3) * 1000, 1)
+
+    log_pipeline_summary(
+        logger=logger,
+        request_id=request_id,
+        jd_preview=req.query,
+        layer1_ms=layer1_ms,
+        layer1_count=len(retrieval_result.candidates),
+        layer2_ms=layer2_ms,
+        layer2_count=len(scored),
+        layer3_ms=layer3_ms,
+        layer3_count=len(judged),
+        provider=settings.llm_provider,
+        model=settings.llm_model,
     )
 
     return FullRankResponse(

@@ -18,16 +18,17 @@ Design decisions:
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
+import uuid
 from typing import Any, Optional
 
 from langchain_core.language_models import BaseChatModel
 from pydantic import BaseModel, Field
 
 from app.config import settings
+from app.logger import get_logger, log_latency
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Output schema — every LLM response is validated against this
@@ -201,12 +202,25 @@ async def _judge_one(
         structured_llm = _get_structured_llm()
 
         for attempt in range(2):
+            t_call = time.perf_counter()
             try:
-                prompt = _build_prompt(jd, candidate, layer2_score, scorer_breakdown)
+                prompt     = _build_prompt(jd, candidate, layer2_score, scorer_breakdown)
                 judgement: LLMJudgement = await structured_llm.ainvoke(prompt)
+                call_ms    = round((time.perf_counter() - t_call) * 1000, 1)
 
-                final_score = round(
-                    0.4 * layer2_score + 0.6 * judgement.llm_score, 4
+                final_score = round(0.4 * layer2_score + 0.6 * judgement.llm_score, 4)
+
+                logger.debug(
+                    "llm_judge candidate scored",
+                    extra={
+                        "candidate_id": cid,
+                        "attempt":      attempt + 1,
+                        "latency_ms":   call_ms,
+                        "llm_score":    judgement.llm_score,
+                        "final_score":  final_score,
+                        "provider":     settings.llm_provider,
+                        "model":        settings.llm_model,
+                    },
                 )
                 return JudgedCandidate(
                     candidate_id=cid,
@@ -225,12 +239,20 @@ async def _judge_one(
                     rrf_score=retrieval_meta.get("rrf_score", 0.0),
                 )
             except Exception as exc:
+                call_ms = round((time.perf_counter() - t_call) * 1000, 1)
                 if attempt == 0:
-                    logger.warning("LLM judge attempt 1 failed for %s: %s — retrying", cid, exc)
+                    logger.warning(
+                        "LLM judge attempt failed — retrying",
+                        extra={"candidate_id": cid, "attempt": 1, "latency_ms": call_ms, "error": str(exc)},
+                    )
                 else:
-                    logger.error("LLM judge failed for %s after 2 attempts: %s — using Layer 2 score", cid, exc)
+                    logger.error(
+                        "LLM judge failed after 2 attempts — falling back to Layer 2 score",
+                        extra={"candidate_id": cid, "latency_ms": call_ms, "error": str(exc)},
+                    )
 
     # Graceful fallback: use Layer 2 score, mark as not LLM-judged
+    logger.warning("llm_judge fallback", extra={"candidate_id": cid, "layer2_score": layer2_score})
     return JudgedCandidate(
         candidate_id=cid,
         rank=0,
@@ -267,8 +289,14 @@ async def judge_candidates(
     pool = layer2_results[:pool_size]
 
     logger.info(
-        "Layer 3: judging %d candidates (pool=%d, final_top_k=%d, provider=%s model=%s)",
-        len(pool), pool_size, final_topk, settings.llm_provider, settings.llm_model,
+        "layer3_judge starting",
+        extra={
+            "pool_size":    len(pool),
+            "final_top_k":  final_topk,
+            "concurrency":  settings.layer3_max_concurrency,
+            "provider":     settings.llm_provider,
+            "model":        settings.llm_model,
+        },
     )
 
     t0 = time.perf_counter()
@@ -279,7 +307,7 @@ async def judge_candidates(
         cid = item["candidate_id"]
         raw = candidates_store.get(cid)
         if raw is None:
-            logger.warning("Candidate %s not in store — skipping Layer 3", cid)
+            logger.warning("Candidate not in store — skipping", extra={"candidate_id": cid})
             continue
         tasks.append(_judge_one(
             semaphore=semaphore,
@@ -305,10 +333,19 @@ async def judge_candidates(
     top = judged_sorted[:final_topk]
 
     llm_judged_count = sum(1 for c in top if c.llm_judged)
+    fallback_count   = len(top) - llm_judged_count
+
     logger.info(
-        "Layer 3 complete: %d/%d LLM-judged in %.1fs (score range %.3f–%.3f)",
-        llm_judged_count, len(top), elapsed,
-        top[-1].final_score if top else 0,
-        top[0].final_score if top else 0,
+        "layer3_judge complete",
+        extra={
+            "total_ms":       round(elapsed * 1000, 1),
+            "judged":         llm_judged_count,
+            "fallbacks":      fallback_count,
+            "output":         len(top),
+            "score_min":      top[-1].final_score if top else 0,
+            "score_max":      top[0].final_score  if top else 0,
+            "provider":       settings.llm_provider,
+            "model":          settings.llm_model,
+        },
     )
     return top
