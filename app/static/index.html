@@ -504,6 +504,12 @@
 
     <div class="section">
       <button class="btn-rank" id="rank-btn">Rank Candidates</button>
+      <button class="btn-rank" id="rank-full-btn" style="margin-top:8px;background:transparent;border:1px solid var(--accent);color:var(--accent2);">
+        ✦ Rank with AI Judge
+      </button>
+      <p style="font-size:11px;color:var(--muted);margin-top:8px;line-height:1.5;">
+        AI Judge runs Layer 3 — LLM reads actual work descriptions and reranks with reasoning. Slower (~30s), but deeper.
+      </p>
       <div id="error-msg" class="error-banner" style="display:none;margin:12px 0 0;"></div>
     </div>
   </div>
@@ -548,6 +554,7 @@
   let currentResults = [];
   let selectedId = null;
   let uploadedFile = null;
+  let lastMode = 'layer2'; // 'layer2' | 'full'
 
   // ── DOM refs ──
   const jdText = document.getElementById('jd-text');
@@ -559,6 +566,7 @@
   const topKSlider = document.getElementById('top-k');
   const topKVal = document.getElementById('top-k-val');
   const rankBtn = document.getElementById('rank-btn');
+  const rankFullBtn = document.getElementById('rank-full-btn');
   const errorMsg = document.getElementById('error-msg');
   const resultsList = document.getElementById('results-list');
   const resultsTitle = document.getElementById('results-title');
@@ -603,10 +611,12 @@
   topKSlider.addEventListener('input', () => { topKVal.textContent = topKSlider.value; });
 
   // ── Rank ──
-  rankBtn.addEventListener('click', runRanking);
+  rankBtn.addEventListener('click', () => runRanking('layer2'));
+  rankFullBtn.addEventListener('click', () => runRanking('full'));
 
-  async function runRanking() {
+  async function runRanking(mode) {
     errorMsg.style.display = 'none';
+    lastMode = mode;
     const topK = parseInt(topKSlider.value);
     const fd = new FormData();
     fd.append('signal_top_k', topK);
@@ -620,13 +630,16 @@
       fd.append('jd_text', text);
     }
 
+    const endpoint = mode === 'full' ? '/api/rank/full/upload' : '/api/rank/upload';
     rankBtn.disabled = true;
-    rankBtn.textContent = 'Ranking…';
-    setResultsLoading();
+    rankFullBtn.disabled = true;
+    rankBtn.textContent = mode === 'full' ? 'Ranking…' : 'Ranking…';
+    rankFullBtn.textContent = mode === 'full' ? '✦ Judging with AI…' : '✦ Rank with AI Judge';
+    setResultsLoading(mode);
 
     const t0 = performance.now();
     try {
-      const res = await fetch('/api/rank/upload', { method: 'POST', body: fd });
+      const res = await fetch(endpoint, { method: 'POST', body: fd });
       const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
       if (!res.ok) {
         const err = await res.json().catch(() => ({ detail: res.statusText }));
@@ -634,27 +647,33 @@
       }
       const data = await res.json();
       currentResults = data.candidates;
-      renderResults(data, elapsed);
+      renderResults(data, elapsed, mode);
     } catch (e) {
       showError(e.message);
       setResultsEmpty();
     } finally {
       rankBtn.disabled = false;
+      rankFullBtn.disabled = false;
       rankBtn.textContent = 'Rank Candidates';
+      rankFullBtn.textContent = '✦ Rank with AI Judge';
     }
   }
 
-  function setResultsLoading() {
+  function setResultsLoading(mode) {
     statsRow.style.display = 'none';
-    resultsList.innerHTML = `<div class="empty-state"><div class="spinner"></div><p>Ranking candidates…</p></div>`;
+    const msg = mode === 'full'
+      ? 'Running AI judge — reading work descriptions…'
+      : 'Ranking candidates…';
+    resultsList.innerHTML = `<div class="empty-state"><div class="spinner"></div><p>${msg}</p></div>`;
   }
   function setResultsEmpty() {
     resultsList.innerHTML = `<div class="empty-state"><p>No results.</p></div>`;
   }
   function showError(msg) { errorMsg.textContent = msg; errorMsg.style.display = 'block'; }
 
-  function renderResults(data, elapsed) {
-    resultsTitle.textContent = `Top ${data.candidates.length} Candidates`;
+  function renderResults(data, elapsed, mode) {
+    const isFullPipeline = mode === 'full';
+    resultsTitle.textContent = `Top ${data.candidates.length} Candidates${isFullPipeline ? ' — AI Ranked' : ''}`;
     statRetrieved.textContent = data.total_retrieved.toLocaleString();
     statScored.textContent = data.total_scored.toLocaleString();
     statTime.textContent = elapsed + 's';
@@ -662,30 +681,36 @@
 
     resultsList.innerHTML = '';
     data.candidates.forEach(c => {
-      resultsList.appendChild(buildCard(c));
+      resultsList.appendChild(buildCard(c, isFullPipeline));
     });
 
-    // re-highlight if same candidate still selected
     if (selectedId) {
       const card = resultsList.querySelector(`[data-id="${selectedId}"]`);
       if (card) card.classList.add('active');
     }
   }
 
-  function buildCard(c) {
+  function buildCard(c, isFullPipeline) {
     const card = document.createElement('div');
     card.className = 'candidate-card';
     card.dataset.id = c.candidate_id;
 
     const rankClass = c.rank <= 3 ? 'top3' : c.rank <= 10 ? 'top10' : 'rest';
-    const pct = Math.round(c.composite_score * 100);
+
+    // Full pipeline uses final_score; layer2 uses composite_score
+    const rawScore = isFullPipeline ? c.final_score : c.composite_score;
+    const pct = Math.round((rawScore || 0) * 100);
     const scoreColor = pct >= 70 ? 'var(--green)' : pct >= 50 ? 'var(--yellow)' : 'var(--muted)';
 
-    // Gather top scorer names for tags
-    const topScorers = [...c.scorer_breakdown]
+    const topScorers = [...(c.scorer_breakdown || [])]
       .sort((a, b) => b.score - a.score)
       .slice(0, 3)
       .map(s => friendlyName(s.scorer));
+
+    // AI summary tag if available
+    const aiTag = (isFullPipeline && c.llm_judged && c.summary)
+      ? `<span class="tag" style="background:rgba(167,139,250,0.1);color:var(--accent2);border-color:rgba(167,139,250,0.3);max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${esc(c.summary)}">✦ ${esc(truncate(c.summary, 60))}</span>`
+      : '';
 
     card.innerHTML = `
       <div class="rank-badge ${rankClass}">#${c.rank}</div>
@@ -693,18 +718,18 @@
         <div class="card-name" id="name-${c.candidate_id}">Loading…</div>
         <div class="card-title" id="title-${c.candidate_id}"></div>
         <div class="card-tags">
-          ${topScorers.map(n => `<span class="tag skill">${n}</span>`).join('')}
+          ${aiTag}
+          ${!aiTag ? topScorers.map(n => `<span class="tag skill">${n}</span>`).join('') : ''}
         </div>
       </div>
       <div class="card-score-col">
         <div class="score-value" style="color:${scoreColor}">${pct}%</div>
-        <div class="score-label">match</div>
+        <div class="score-label">${isFullPipeline ? 'AI score' : 'match'}</div>
         <div class="score-bar"><div class="score-fill" style="width:${pct}%"></div></div>
       </div>
     `;
-    card.addEventListener('click', () => openDetail(c));
+    card.addEventListener('click', () => openDetail(c, isFullPipeline));
 
-    // Lazy-load candidate name/title
     fetchCandidateSummary(c.candidate_id).then(profile => {
       const nameEl = document.getElementById(`name-${c.candidate_id}`);
       const titleEl = document.getElementById(`title-${c.candidate_id}`);
@@ -739,8 +764,7 @@
     selectedId = null;
   });
 
-  async function openDetail(scored) {
-    // toggle off if same card clicked
+  async function openDetail(scored, isFullPipeline) {
     if (selectedId === scored.candidate_id) {
       closeDetail.click();
       return;
@@ -760,16 +784,17 @@
       const res = await fetch(`/api/candidates/${scored.candidate_id}`);
       if (!res.ok) throw new Error('Not found');
       const candidate = await res.json();
-      detailBody.innerHTML = buildDetailHTML(candidate, scored);
+      detailBody.innerHTML = buildDetailHTML(candidate, scored, isFullPipeline);
     } catch (e) {
       detailBody.innerHTML = `<div class="empty-state"><p>Could not load profile: ${e.message}</p></div>`;
     }
   }
 
-  function buildDetailHTML(c, scored) {
+  function buildDetailHTML(c, scored, isFullPipeline) {
     const p = c.profile;
     const signals = c.redrob_signals;
-    const pct = Math.round(scored.composite_score * 100);
+    const rawScore = isFullPipeline ? scored.final_score : scored.composite_score;
+    const pct = Math.round((rawScore || 0) * 100);
 
     // Score breakdown bars
     const breakdownBars = scored.scorer_breakdown.map(s => `
@@ -852,6 +877,32 @@
         </div>
         <div class="breakdown-bars">${breakdownBars}</div>
       </div>
+
+      ${isFullPipeline && scored.llm_judged ? `
+        <div class="detail-section">
+          <div class="detail-section-title">AI Judge Reasoning</div>
+          <div style="display:flex;flex-direction:column;gap:8px;">
+            ${scored.fit_reasons && scored.fit_reasons.length ? `
+              <div style="background:rgba(52,211,153,0.07);border:1px solid rgba(52,211,153,0.2);border-radius:8px;padding:10px 12px;">
+                <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.6px;color:var(--green);margin-bottom:6px;">Why this candidate fits</div>
+                ${scored.fit_reasons.map(r => `<div style="font-size:12px;color:var(--text);line-height:1.6;display:flex;gap:6px;margin-bottom:3px;"><span style="color:var(--green);flex-shrink:0;">✓</span><span>${esc(r)}</span></div>`).join('')}
+              </div>` : ''}
+            ${scored.risks && scored.risks.length ? `
+              <div style="background:rgba(251,191,36,0.07);border:1px solid rgba(251,191,36,0.2);border-radius:8px;padding:10px 12px;">
+                <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.6px;color:var(--yellow);margin-bottom:6px;">Risks / gaps</div>
+                ${scored.risks.map(r => `<div style="font-size:12px;color:var(--text);line-height:1.6;display:flex;gap:6px;margin-bottom:3px;"><span style="color:var(--yellow);flex-shrink:0;">⚠</span><span>${esc(r)}</span></div>`).join('')}
+              </div>` : ''}
+            ${scored.confidence != null ? `
+              <div style="display:flex;align-items:center;gap:8px;margin-top:2px;">
+                <span style="font-size:11px;color:var(--muted);">AI confidence</span>
+                <div style="flex:1;height:4px;background:var(--border);border-radius:2px;overflow:hidden;">
+                  <div style="height:100%;width:${Math.round(scored.confidence*100)}%;background:var(--accent2);border-radius:2px;"></div>
+                </div>
+                <span style="font-size:11px;color:var(--accent2);font-weight:600;">${Math.round(scored.confidence*100)}%</span>
+              </div>` : ''}
+          </div>
+        </div>
+      ` : ''}
 
       ${p.summary ? `
         <div class="detail-section">
