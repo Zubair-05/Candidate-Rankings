@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     groq_api_key: str = ""
 
+    # ── Qdrant ────────────────────────────────────────────────────────────────
+    qdrant_url: str = "http://localhost:6333"
+    qdrant_collection: str = "candidates"
+
     model_config = {"env_file": ".env", "extra": "ignore"}
 
 
